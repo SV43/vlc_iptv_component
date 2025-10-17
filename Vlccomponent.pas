@@ -22,6 +22,8 @@ type
     FUserAgent: string;
     FReferer: string;
     FHttpHeaders: TStringList;
+    FAutoDetectProtectedStreams: Boolean;
+    FForceWinkHeaders: Boolean;
 
     FInstance: Pointer;
     FMedia: Pointer;
@@ -41,7 +43,6 @@ type
     T_libvlc_media_player_set_hwnd: procedure(p_player: Pointer; hwnd: Pointer); cdecl;
     T_libvlc_audio_set_volume: procedure(p_player: Pointer; volume: Integer); cdecl;
     T_libvlc_media_add_option: procedure(p_media: Pointer; psz_options: PAnsiChar); cdecl;
-    T_libvlc_media_new_location_with_options: function(p_instance: Pointer; psz_mrl: PAnsiChar; options: Integer; ppsz_options: PPAnsiChar): Pointer; cdecl;
 
     // События
     FOnPlaying: TVlcNotifyEvent;
@@ -65,6 +66,9 @@ type
     function GetLastErrorText: string;
     procedure Log(const Msg: string);
     function BuildVlcOptions: TStringList;
+    function IsProtectedStream(const AUrl: string): Boolean;
+    function TestStreamProtection(const AUrl: string): Boolean;
+    procedure ApplyAppropriateHeaders(const AUrl: string);
   public
     constructor Create(AOwner: TComponent); override;
     destructor Destroy; override;
@@ -79,8 +83,11 @@ type
     procedure AddHttpHeader(const AName, AValue: string);
     procedure ClearHttpHeaders;
     procedure SetWinkHeaders;
+    procedure SetBasicHeaders;
 
     property Handle: HWND read FVideoHandle write FVideoHandle;
+    property AutoDetectProtectedStreams: Boolean read FAutoDetectProtectedStreams write FAutoDetectProtectedStreams default True;
+    property ForceWinkHeaders: Boolean read FForceWinkHeaders write FForceWinkHeaders default False;
 
   published
     property LibPath: string read FLibPath write FLibPath;
@@ -120,6 +127,11 @@ begin
   FAutoPlay := True;
   FVolume := 100;
   FState := vlcIdle;
+  FAutoDetectProtectedStreams := True;
+  FForceWinkHeaders := False;
+
+  // Устанавливаем базовые заголовки по умолчанию
+  SetBasicHeaders;
 end;
 
 destructor TVlcPlayerEx.Destroy;
@@ -147,47 +159,152 @@ begin
     Result := 'Неизвестная ошибка';
 end;
 
-function TVlcPlayerEx.BuildVlcOptions: TStringList;
+function TVlcPlayerEx.IsProtectedStream(const AUrl: string): Boolean;
 begin
-  Result := TStringList.Create;
-  try
-    // Базовые опции
-    Result.Add(':no-video-title-show');
-    Result.Add(':network-caching=3000');
+  Result := False;
 
-    // HTTP опции
-    if FUserAgent <> '' then
-      Result.Add(':http-user-agent=' + FUserAgent);
-
-    if FReferer <> '' then
-      Result.Add(':http-referer=' + FReferer);
-
-    // Добавляем кастомные заголовки
-    for var I := 0 to FHttpHeaders.Count - 1 do
-    begin
-      if FHttpHeaders.Names[I] <> '' then
-        Result.Add(':http-extra-header=' + FHttpHeaders.Names[I] + ': ' + FHttpHeaders.ValueFromIndex[I]);
-    end;
-
-    // HLS опции
-    Result.Add(':hls-prefer-native');
-    Result.Add(':hls-preferred-resolution=720');
-
-    // Логируем опции
-    Log('Опции VLC:');
-    for var I := 0 to Result.Count - 1 do
-      Log('  ' + Result[I]);
-
-  except
-    Result.Free;
-    raise;
+  // Если принудительно включены Wink заголовки
+  if FForceWinkHeaders then
+  begin
+    Result := True;
+    Log('🔐 Принудительно применены Wink заголовки');
+    Exit;
   end;
+
+  // Проверяем по доменам защищенных стриминговых сервисов
+  if (Pos('wink.', LowerCase(AUrl)) > 0) or
+     (Pos('wink.ru', LowerCase(AUrl)) > 0) or
+     (Pos('cdn.wink.', LowerCase(AUrl)) > 0) then
+  begin
+    Result := True;
+    Log('🔐 Обнаружен Wink поток');
+    Exit;
+  end;
+
+  if (Pos('okko.', LowerCase(AUrl)) > 0) or
+     (Pos('okko.ru', LowerCase(AUrl)) > 0) or
+     (Pos('okko.team', LowerCase(AUrl)) > 0) then
+  begin
+    Result := True;
+    Log('🔐 Обнаружен Okko поток');
+    Exit;
+  end;
+
+  if (Pos('ivi.', LowerCase(AUrl)) > 0) or
+     (Pos('ivi.ru', LowerCase(AUrl)) > 0) or
+     (Pos('cdn.ivi.', LowerCase(AUrl)) > 0) then
+  begin
+    Result := True;
+    Log('🔐 Обнаружен Ivi поток');
+    Exit;
+  end;
+
+  if (Pos('start.', LowerCase(AUrl)) > 0) or
+     (Pos('more.tv', LowerCase(AUrl)) > 0) then
+  begin
+    Result := True;
+    Log('🔐 Обнаружен Start/MORE.TV поток');
+    Exit;
+  end;
+
+  // Проверяем по другим признакам DRM/защищенных потоков
+  if (Pos('drm', LowerCase(AUrl)) > 0) or
+     (Pos('widevine', LowerCase(AUrl)) > 0) or
+     (Pos('playready', LowerCase(AUrl)) > 0) or
+     (Pos('fairplay', LowerCase(AUrl)) > 0) or
+     (Pos('license', LowerCase(AUrl)) > 0) or
+     (Pos('auth', LowerCase(AUrl)) > 0) or
+     (Pos('token', LowerCase(AUrl)) > 0) or
+     (Pos('secure', LowerCase(AUrl)) > 0) or
+     (Pos('protection', LowerCase(AUrl)) > 0) then
+  begin
+    Result := True;
+    Log('🔐 Обнаружен DRM/защищенный поток по ключевым словам');
+  end;
+end;
+
+function TVlcPlayerEx.TestStreamProtection(const AUrl: string): Boolean;
+begin
+  // Этот метод можно расширить для реального тестирования потока
+  // Пока используем эвристический анализ URL
+  Result := IsProtectedStream(AUrl);
+
+  if not Result then
+  begin
+    // Дополнительные проверки для сложных случаев
+    // Например, проверка наличия специфичных параметров
+    if (Pos('m3u8', LowerCase(AUrl)) > 0) and
+       ((Pos('signature', LowerCase(AUrl)) > 0) or
+        (Pos('expires', LowerCase(AUrl)) > 0) or
+        (Pos('policy', LowerCase(AUrl)) > 0)) then
+    begin
+      Result := True;
+      Log('🔐 Обнаружен защищенный HLS поток по параметрам URL');
+    end;
+  end;
+end;
+
+procedure TVlcPlayerEx.ApplyAppropriateHeaders(const AUrl: string);
+var
+  IsProtected: Boolean;
+begin
+  if FForceWinkHeaders then
+  begin
+    // Принудительное применение Wink заголовков
+    SetWinkHeaders;
+    Log('✅ Принудительно применены Wink заголовки');
+    Exit;
+  end;
+
+  if not FAutoDetectProtectedStreams then
+  begin
+    // Автоопределение отключено, используем базовые заголовки
+    SetBasicHeaders;
+    Log('✅ Автоопределение отключено, применены базовые заголовки');
+    Exit;
+  end;
+
+  // Определяем тип потока
+  IsProtected := TestStreamProtection(AUrl);
+
+  if IsProtected then
+  begin
+    // Для защищенных потоков применяем Wink заголовки
+    SetWinkHeaders;
+    Log('✅ Автоматически применены Wink заголовки для защищенного потока');
+  end
+  else
+  begin
+    // Для обычных потоков применяем базовые заголовки
+    SetBasicHeaders;
+    Log('✅ Применены базовые заголовки для обычного потока');
+  end;
+end;
+
+procedure TVlcPlayerEx.SetBasicHeaders;
+begin
+  FHttpHeaders.Clear;
+
+  // Базовые заголовки для обычных потоков
+  FHttpHeaders.Values['Accept'] := '*/*';
+  FHttpHeaders.Values['Accept-Language'] := 'en-US,en;q=0.9';
+  FHttpHeaders.Values['Cache-Control'] := 'no-cache';
+
+  // Базовый User-Agent (можно оставить VLC или установить простой)
+  FUserAgent := 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
+
+  // Referer не устанавливаем для обычных потоков
+  FReferer := '';
+
+  Log('✅ Установлены базовые заголовки');
+  Log('User-Agent: ' + FUserAgent);
 end;
 
 procedure TVlcPlayerEx.SetWinkHeaders;
 begin
   FHttpHeaders.Clear;
 
+  // Полный набор заголовков для Wink и других защищенных сервисов
   FHttpHeaders.Values['Accept'] := '*/*';
   FHttpHeaders.Values['Accept-Language'] := 'ru-RU,ru;q=0.9,en;q=0.8';
   FHttpHeaders.Values['Accept-Encoding'] := 'gzip, deflate, br';
@@ -196,6 +313,7 @@ begin
   FHttpHeaders.Values['Pragma'] := 'no-cache';
   FHttpHeaders.Values['Origin'] := 'https://wink.ru';
 
+  // Security-заголовки
   FHttpHeaders.Values['Sec-Fetch-Dest'] := 'empty';
   FHttpHeaders.Values['Sec-Fetch-Mode'] := 'cors';
   FHttpHeaders.Values['Sec-Fetch-Site'] := 'cross-site';
@@ -203,13 +321,15 @@ begin
   FHttpHeaders.Values['Sec-Ch-Ua-Mobile'] := '?0';
   FHttpHeaders.Values['Sec-Ch-Ua-Platform'] := '"Windows"';
 
+  // Дополнительные заголовки
   FHttpHeaders.Values['DNT'] := '1';
   FHttpHeaders.Values['Upgrade-Insecure-Requests'] := '1';
 
+  // Современный User-Agent
   FUserAgent := 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
   FReferer := 'https://wink.ru/';
 
-  Log('✅ Установлены заголовки Wink');
+  Log('✅ Установлены Wink заголовки для защищенного потока');
   Log('User-Agent: ' + FUserAgent);
   Log('Referer: ' + FReferer);
 end;
@@ -251,6 +371,43 @@ begin
   begin
     FState := Value;
     Log('Состояние: ' + StateNames[Value]);
+  end;
+end;
+
+function TVlcPlayerEx.BuildVlcOptions: TStringList;
+begin
+  Result := TStringList.Create;
+  try
+    // Базовые опции для всех потоков
+    Result.Add(':no-video-title-show');
+    Result.Add(':network-caching=3000');
+
+    // HTTP опции
+    if FUserAgent <> '' then
+      Result.Add(':http-user-agent=' + FUserAgent);
+
+    if FReferer <> '' then
+      Result.Add(':http-referer=' + FReferer);
+
+    // Добавляем кастомные заголовки только если они есть
+    for var I := 0 to FHttpHeaders.Count - 1 do
+    begin
+      if FHttpHeaders.Names[I] <> '' then
+        Result.Add(':http-extra-header=' + FHttpHeaders.Names[I] + ': ' + FHttpHeaders.ValueFromIndex[I]);
+    end;
+
+    // HLS опции
+    Result.Add(':hls-prefer-native');
+    Result.Add(':hls-preferred-resolution=720');
+
+    // Логируем опции
+    Log('Опции VLC:');
+    for var I := 0 to Result.Count - 1 do
+      Log('  ' + Result[I]);
+
+  except
+    Result.Free;
+    raise;
   end;
 end;
 
@@ -344,7 +501,6 @@ begin
   @T_libvlc_media_player_set_hwnd := GetProc('libvlc_media_player_set_hwnd');
   @T_libvlc_audio_set_volume := GetProc('libvlc_audio_set_volume');
   @T_libvlc_media_add_option := GetProc('libvlc_media_add_option');
-  @T_libvlc_media_new_location_with_options := GetProc('libvlc_media_new_location_with_options');
 end;
 
 procedure TVlcPlayerEx.FreeVLC;
@@ -425,6 +581,9 @@ begin
     Log('❌ Ошибка: Пустой URL медиа');
     Exit;
   end;
+
+  // АВТОМАТИЧЕСКИ ПРИМЕНЯЕМ ПРАВИЛЬНЫЕ ЗАГОЛОВКИ ДЛЯ ТИПА ПОТОКА
+  ApplyAppropriateHeaders(APath);
 
   SetState(vlcLoading);
   if Assigned(FOnLoading) then
