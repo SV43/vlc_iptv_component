@@ -5,7 +5,7 @@
         <ProjectVersion>20.1</ProjectVersion>
         <FrameworkType>VCL</FrameworkType>
         <Base>True</Base>
-        <Config Condition="'$(Config)'==''">Debug</Config>
+        <Config Condition="'$(Config)'==''">Release</Config>
         <Platform Condition="'$(Platform)'==''">Win32</Platform>
         <ProjectName Condition="'$(ProjectName)'==''">vlc</ProjectName>
         <TargetedPlatforms>1</TargetedPlatforms>
@@ -136,6 +136,7 @@
         <DCCReference Include="vclx.dcp"/>
         <DCCReference Include="xmlrtl.dcp"/>
         <DCCReference Include="Vlccomponent.pas"/>
+        <DCCReference Include="VlcVisualComponent.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
         </BuildConfiguration>
@@ -162,7 +163,7 @@
                 </Source>
             </Delphi.Personality>
             <Deployment Version="4">
-                <DeployFile LocalName="..\..\..\..\..\Public\Documents\Embarcadero\Studio\23.0\Bpl\vlc.bpl" Configuration="Debug" Class="ProjectOutput">
+                <DeployFile LocalName="C:\Users\Public\Documents\Embarcadero\Studio\23.0\Bpl\vlc.bpl" Configuration="Debug" Class="ProjectOutput">
                     <Platform Name="Win32">
                         <RemoteName>vlc.bpl</RemoteName>
                         <Overwrite>true</Overwrite>

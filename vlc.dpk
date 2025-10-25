@@ -36,6 +36,7 @@ requires
   xmlrtl;
 
 contains
-  Vlccomponent in 'Vlccomponent.pas';
+  Vlccomponent in 'Vlccomponent.pas',
+  VlcVisualComponent in 'VlcVisualComponent.pas';
 
 end.
