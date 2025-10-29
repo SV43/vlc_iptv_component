@@ -24,6 +24,11 @@ type
   TVlcLogEvent = procedure(Sender: TObject; const Msg: string) of object;
   TVlcProgressEvent = procedure(Sender: TObject; Progress: Integer) of object;
 
+  // События мыши
+  TVlcMouseEvent = procedure(Sender: TObject; Button: TMouseButton; Shift: TShiftState; X, Y: Integer) of object;
+  TVlcMouseMoveEvent = procedure(Sender: TObject; Shift: TShiftState; X, Y: Integer) of object;
+  TVlcMouseWheelEvent = procedure(Sender: TObject; Shift: TShiftState; WheelDelta: Integer; MousePos: TPoint) of object;
+
   // Текстовая информация для отображения
   TDisplayTextItem = class(TPersistent)
   private
@@ -66,7 +71,6 @@ type
     FMediaURL: string;             // URL медиа-потока
     FVolume: Integer;              // Громкость (0-100)
     FAutoPlay: Boolean;            // Автоматическое воспроизведение
-    FVideoHandle: HWND;            // Хэндл окна для вывода видео
     FOriginalParent: TWinControl;  // Исходный родительский контрол
     FUserAgent: string;            // User-Agent для HTTP-запросов
     FReferer: string;              // Referer для HTTP-запросов
@@ -81,7 +85,7 @@ type
     FMuted: Boolean;               // Флаг состояния звука (включен/выключен)
 
     // Дочерняя панель для видео с отступами
-    FVideoPanel: TPanel;           // Панель для вывода видео
+
     FVideoTopMargin: Integer;      // Отступ сверху для видео
     FVideoBottomMargin: Integer;   // Отступ снизу для видео
 
@@ -136,6 +140,14 @@ type
     FOnBuffering: TVlcProgressEvent;
     FOnQualityChanged: TVlcNotifyEvent;
 
+    // НОВЫЕ СОБЫТИЯ МЫШИ
+    FOnVideoMouseDown: TVlcMouseEvent;
+    FOnVideoMouseUp: TVlcMouseEvent;
+    FOnVideoMouseMove: TVlcMouseMoveEvent;
+    FOnVideoClick: TVlcNotifyEvent;
+    FOnVideoDblClick: TVlcNotifyEvent;
+    FOnVideoMouseWheel: TVlcMouseWheelEvent;
+
     // Текстовые элементы для отображения
     FInfoText: TDisplayTextItem;
     FShowTextWhenIdle: Boolean;
@@ -143,6 +155,11 @@ type
     // Изображения
     FTopImage: TPicture;
     FShowTopImage: Boolean;
+
+    // Для перехвата сообщений мыши
+    FOriginalWndProc: TWndMethod;
+    FLastMousePos: TPoint;
+    FMouseCapture: Boolean;
 
     // Приватные методы
     procedure SetMediaURL(const Value: string);
@@ -198,12 +215,20 @@ type
     procedure CreateHandle;
     procedure DestroyWnd;
 
+    // НОВЫЕ МЕТОДЫ ДЛЯ ПЕРЕХВАТА СОБЫТИЙ МЫШИ
+    procedure MainWndProc(var Message: TMessage);
+    function GetShiftState: TShiftState;
+    function ScreenToVideo(const ScreenPos: TPoint): TPoint;
+    function IsPointInVideoPanel(const P: TPoint): Boolean;
+
   protected
     procedure Paint; override;
     procedure WndProc(var Message: TMessage); override;
     procedure Resize; override;
 
   public
+    FVideoHandle: HWND;            // Хэндл окна для вывода видео
+    FVideoPanel: TPanel;           // Панель для вывода видео
     constructor Create(AOwner: TComponent); override;
     destructor Destroy; override;
 
@@ -256,6 +281,9 @@ type
     procedure ShowAll;
     procedure HideAll;
 
+    // Методы для работы с мышью
+    procedure EnableMouseEvents;
+
     // Публичные свойства
     property Handle: HWND read FVideoHandle;
     property AutoDetectProtectedStreams: Boolean read FAutoDetectProtectedStreams write FAutoDetectProtectedStreams default True;
@@ -272,7 +300,9 @@ type
     function GetCurrentMediaURL: string;
     procedure SetNewParent(NewParent: TWinControl);
     function GetActualLoadingProgress: Integer;
+    function IsPointInVideoArea(const P: TPoint): Boolean;
 
+    procedure ForceRehookMouseEvents;
   published
     // Опубликованные свойства
     property LibPath: string read FLibPath write FLibPath;
@@ -303,6 +333,14 @@ type
     property OnLoadingProgress: TVlcProgressEvent read FOnLoadingProgress write FOnLoadingProgress;
     property OnBuffering: TVlcProgressEvent read FOnBuffering write FOnBuffering;
     property OnQualityChanged: TVlcNotifyEvent read FOnQualityChanged write FOnQualityChanged;
+
+    // НОВЫЕ СОБЫТИЯ МЫШИ ДЛЯ ВИДЕО ПОТОКА
+    property OnVideoMouseDown: TVlcMouseEvent read FOnVideoMouseDown write FOnVideoMouseDown;
+    property OnVideoMouseUp: TVlcMouseEvent read FOnVideoMouseUp write FOnVideoMouseUp;
+    property OnVideoMouseMove: TVlcMouseMoveEvent read FOnVideoMouseMove write FOnVideoMouseMove;
+    property OnVideoClick: TVlcNotifyEvent read FOnVideoClick write FOnVideoClick;
+    property OnVideoDblClick: TVlcNotifyEvent read FOnVideoDblClick write FOnVideoDblClick;
+    property OnVideoMouseWheel: TVlcMouseWheelEvent read FOnVideoMouseWheel write FOnVideoMouseWheel;
 
     // Свойства TCustomPanel
     property Align;
@@ -581,6 +619,279 @@ end;
 
 { TVlcPlayer }
 
+function TVlcPlayer.IsPointInVideoArea(const P: TPoint): Boolean;
+begin
+  Result := False;
+  if FVideoPanel = nil then Exit;
+
+  Result := (P.X >= FVideoPanel.Left) and
+            (P.Y >= FVideoPanel.Top) and
+            (P.X < FVideoPanel.Left + FVideoPanel.Width) and
+            (P.Y < FVideoPanel.Top + FVideoPanel.Height);
+end;
+
+procedure TVlcPlayer.ForceRehookMouseEvents;
+begin
+  Log('ForceRehookMouseEvents: Starting forced mouse hook reinitialization...');
+
+  try
+    // 1. Временно отключаем перехват
+    if Assigned(FOriginalWndProc) then
+    begin
+      WindowProc := FOriginalWndProc;
+      Log('ForceRehookMouseEvents: Original WndProc restored temporarily');
+    end;
+
+    // 2. Ждем немного для стабильности
+    Sleep(10);
+
+    // 3. Принудительно обновляем видео handle
+    UpdateVideoHandle;
+
+    if FVideoHandle <> 0 then
+    begin
+      Log(Format('ForceRehookMouseEvents: Video handle updated to %d', [FVideoHandle]));
+    end
+    else
+    begin
+      Log('ForceRehookMouseEvents: WARNING - Video handle is zero!');
+    end;
+
+    // 4. Снова включаем перехват
+    FOriginalWndProc := WindowProc;
+    WindowProc := MainWndProc;
+
+    // 5. Принудительно обновляем геометрию
+    UpdateVideoPanelMargins;
+
+    // 6. Логируем состояние
+    if FVideoPanel <> nil then
+    begin
+      Log(Format('ForceRehookMouseEvents: Video panel at [%d,%d,%d,%d]',
+        [FVideoPanel.Left, FVideoPanel.Top, FVideoPanel.Width, FVideoPanel.Height]));
+    end
+    else
+    begin
+      Log('ForceRehookMouseEvents: WARNING - Video panel is nil!');
+    end;
+
+    Log('ForceRehookMouseEvents: Mouse hook force re-established successfully');
+
+  except
+    on E: Exception do
+    begin
+      Log(Format('ForceRehookMouseEvents: ERROR - %s', [E.Message]));
+      // Пытаемся восстановить перехват даже при ошибке
+      if Assigned(FOriginalWndProc) then
+      begin
+        FOriginalWndProc := WindowProc;
+        WindowProc := MainWndProc;
+        Log('ForceRehookMouseEvents: Emergency mouse hook restoration attempted');
+      end;
+    end;
+  end;
+end;
+
+// НОВЫЕ МЕТОДЫ ДЛЯ ПЕРЕХВАТА СОБЫТИЙ МЫШИ
+procedure TVlcPlayer.MainWndProc(var Message: TMessage);
+var
+  Shift: TShiftState;
+  WheelDelta: Integer;
+  MousePos, VideoPos: TPoint;
+  Handled: Boolean;
+
+  function GetMouseButton: TMouseButton;
+  begin
+    case Message.Msg of
+      WM_LBUTTONDOWN, WM_LBUTTONUP, WM_LBUTTONDBLCLK: Result := mbLeft;
+      WM_RBUTTONDOWN, WM_RBUTTONUP, WM_RBUTTONDBLCLK: Result := mbRight;
+      WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MBUTTONDBLCLK: Result := mbMiddle;
+    else
+      Result := mbLeft;
+    end;
+  end;
+
+begin
+  Handled := False;
+  Shift := GetShiftState;
+
+  case Message.Msg of
+    WM_MOUSEWHEEL:
+      begin
+        if IsPointInVideoPanel(SmallPointToPoint(TSmallPoint(Message.LParam))) then
+        begin
+          WheelDelta := SmallInt(Message.WParam shr 16);
+          MousePos := SmallPointToPoint(TSmallPoint(Message.LParam));
+          VideoPos := ScreenToVideo(MousePos);
+
+          Log(Format('MAIN MOUSEWHEEL: Delta=%d, Screen(%d,%d) -> Video(%d,%d)',
+            [WheelDelta, MousePos.X, MousePos.Y, VideoPos.X, VideoPos.Y]));
+
+          if Assigned(FOnVideoMouseWheel) then
+            FOnVideoMouseWheel(Self, Shift, WheelDelta, VideoPos);
+
+          Message.Result := 1;
+          Handled := True;
+        end;
+      end;
+
+    WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN:
+      begin
+        if IsPointInVideoPanel(SmallPointToPoint(TSmallPoint(Message.LParam))) then
+        begin
+          MousePos := SmallPointToPoint(TSmallPoint(Message.LParam));
+          VideoPos := ScreenToVideo(MousePos);
+
+          Log(Format('MAIN MOUSEDOWN: Button=%d, Screen(%d,%d) -> Video(%d,%d)',
+            [Ord(GetMouseButton), MousePos.X, MousePos.Y, VideoPos.X, VideoPos.Y]));
+
+          if Assigned(FOnVideoMouseDown) then
+            FOnVideoMouseDown(Self, GetMouseButton, Shift, VideoPos.X, VideoPos.Y);
+
+          // Захватываем мышь для отслеживания перемещения
+          SetCapture(Handle);
+          FMouseCapture := True;
+          FLastMousePos := MousePos;
+
+          Handled := True;
+        end;
+      end;
+
+    WM_LBUTTONUP, WM_RBUTTONUP, WM_MBUTTONUP:
+      begin
+        if FMouseCapture then
+        begin
+          ReleaseCapture;
+          FMouseCapture := False;
+
+          MousePos := SmallPointToPoint(TSmallPoint(Message.LParam));
+          VideoPos := ScreenToVideo(MousePos);
+
+          Log(Format('MAIN MOUSEUP: Button=%d, Screen(%d,%d) -> Video(%d,%d)',
+            [Ord(GetMouseButton), MousePos.X, MousePos.Y, VideoPos.X, VideoPos.Y]));
+
+          if Assigned(FOnVideoMouseUp) then
+            FOnVideoMouseUp(Self, GetMouseButton, Shift, VideoPos.X, VideoPos.Y);
+
+          // Вызываем Click для левой кнопки
+          if (GetMouseButton = mbLeft) and Assigned(FOnVideoClick) then
+            FOnVideoClick(Self);
+
+          Handled := True;
+        end;
+      end;
+
+    WM_LBUTTONDBLCLK, WM_RBUTTONDBLCLK, WM_MBUTTONDBLCLK:
+      begin
+        if IsPointInVideoPanel(SmallPointToPoint(TSmallPoint(Message.LParam))) then
+        begin
+          MousePos := SmallPointToPoint(TSmallPoint(Message.LParam));
+          VideoPos := ScreenToVideo(MousePos);
+
+          Log(Format('MAIN MOUSEDBLCLK: Button=%d, Screen(%d,%d) -> Video(%d,%d)',
+            [Ord(GetMouseButton), MousePos.X, MousePos.Y, VideoPos.X, VideoPos.Y]));
+
+          // Вызываем двойной клик для левой кнопки
+          if (GetMouseButton = mbLeft) and Assigned(FOnVideoDblClick) then
+            FOnVideoDblClick(Self);
+
+          Handled := True;
+        end;
+      end;
+
+    WM_MOUSEMOVE:
+      begin
+        if FMouseCapture then
+        begin
+          MousePos := SmallPointToPoint(TSmallPoint(Message.LParam));
+
+          // Фильтруем частые сообщения
+          if (Abs(MousePos.X - FLastMousePos.X) > 2) or
+             (Abs(MousePos.Y - FLastMousePos.Y) > 2) then
+          begin
+            VideoPos := ScreenToVideo(MousePos);
+
+            if Random(5) = 0 then // Логируем каждое 5-е сообщение
+              Log(Format('MAIN MOUSEMOVE: Screen(%d,%d) -> Video(%d,%d)',
+                [MousePos.X, MousePos.Y, VideoPos.X, VideoPos.Y]));
+
+            if Assigned(FOnVideoMouseMove) then
+              FOnVideoMouseMove(Self, Shift, VideoPos.X, VideoPos.Y);
+
+            FLastMousePos := MousePos;
+          end;
+        end;
+      end;
+
+    WM_CAPTURECHANGED:
+      begin
+        FMouseCapture := False;
+        Log('Mouse capture lost');
+      end;
+  end;
+
+  if not Handled then
+  begin
+    // Передаем сообщение оригинальному обработчику
+    if Assigned(FOriginalWndProc) then
+      FOriginalWndProc(Message)
+    else
+      inherited WndProc(Message);
+  end;
+end;
+
+function TVlcPlayer.GetShiftState: TShiftState;
+begin
+  Result := [];
+  if GetKeyState(VK_SHIFT) < 0 then Include(Result, ssShift);
+  if GetKeyState(VK_CONTROL) < 0 then Include(Result, ssCtrl);
+  if GetKeyState(VK_MENU) < 0 then Include(Result, ssAlt);
+  if GetKeyState(VK_LBUTTON) < 0 then Include(Result, ssLeft);
+  if GetKeyState(VK_RBUTTON) < 0 then Include(Result, ssRight);
+  if GetKeyState(VK_MBUTTON) < 0 then Include(Result, ssMiddle);
+end;
+
+function TVlcPlayer.ScreenToVideo(const ScreenPos: TPoint): TPoint;
+begin
+  Result := ScreenToClient(ScreenPos);
+  if FVideoPanel <> nil then
+  begin
+    // Преобразуем координаты компонента в координаты видео панели
+    Result.X := Result.X - FVideoPanel.Left;
+    Result.Y := Result.Y - FVideoPanel.Top;
+
+    // Ограничиваем координаты размерами видео панели
+    Result.X := Max(0, Min(Result.X, FVideoPanel.Width - 1));
+    Result.Y := Max(0, Min(Result.Y, FVideoPanel.Height - 1));
+  end;
+end;
+
+function TVlcPlayer.IsPointInVideoPanel(const P: TPoint): Boolean;
+begin
+  Result := False;
+  if FVideoPanel = nil then Exit;
+
+  var LocalPoint := ScreenToClient(P);
+  Result := PtInRect(FVideoPanel.BoundsRect, LocalPoint);
+end;
+
+procedure TVlcPlayer.EnableMouseEvents;
+begin
+  Log('Активация перехвата событий мыши...');
+
+  // Принудительно обновляем handle
+  UpdateVideoHandle;
+
+  // Убедимся что перехват активен
+  if not Assigned(FOriginalWndProc) then
+  begin
+    FOriginalWndProc := WindowProc;
+    WindowProc := MainWndProc;
+  end;
+
+  Log('Перехват событий мыши активирован');
+end;
+
 procedure TVlcPlayer.SetNewParent(NewParent: TWinControl);
 begin
   if FPlayer = nil then Exit;
@@ -615,23 +926,24 @@ begin
     FVideoPanel := TPanel.Create(Self);
     FVideoPanel.Parent := Self;
 
-    // Устанавливаем отступы по умолчанию 60px сверху и снизу
+    // Устанавливаем отступы
     FVideoTopMargin := 50;
     FVideoBottomMargin := 20;
-
-    // Вычисляем размеры с учетом отступов
     UpdateVideoPanelMargins;
 
     FVideoPanel.BevelOuter := bvNone;
-    FVideoPanel.Color := clBlack;
+    FVideoPanel.Color := clBlack; // Сделаем красным для тестирования видимости
     FVideoPanel.ParentBackground := False;
     FVideoPanel.Visible := True;
 
-    // Убедимся, что панель создала handle
-    FVideoPanel.HandleNeeded;
+    // ВАЖНО: Отключаем стандартную обработку мыши для видео панели
+    FVideoPanel.Enabled := False; // Это предотвратит конфликты с VLC
 
+    FVideoPanel.HandleNeeded;
     FVideoHandle := FVideoPanel.Handle;
-    Log('Создана видео панель с отступами, handle: ' + IntToStr(FVideoHandle));
+
+    Log('Видео панель создана (красная для теста), Handle: ' + IntToStr(FVideoHandle));
+    Log('Мышь: события будут перехватываться основным компонентом');
   end;
 end;
 
@@ -670,17 +982,25 @@ procedure TVlcPlayer.UpdateVideoPanelMargins;
 begin
   if FVideoPanel <> nil then
   begin
-    // Устанавливаем положение и размер с учетом отступов
+    // ИСПОЛЬЗУЕМ ClientWidth вместо Width!
+    var NewWidth := ClientWidth;
+    var NewHeight := ClientHeight - FVideoTopMargin - FVideoBottomMargin;
+
+    if NewWidth < 10 then NewWidth := 10;
+    if NewHeight < 10 then NewHeight := 10;
+
     FVideoPanel.SetBounds(
       0,
       FVideoTopMargin,
-      Width,
-      Height - FVideoTopMargin - FVideoBottomMargin
+      NewWidth,
+      NewHeight
     );
-    Log(Format('Обновлены отступы видео: верх=%dpx, низ=%dpx', [FVideoTopMargin, FVideoBottomMargin]));
+
+    Log(Format('VIDEO PANEL UPDATED: [L:%d,T:%d,W:%d,H:%d] (Client: %dx%d, Bounds: %dx%d)',
+      [FVideoPanel.Left, FVideoPanel.Top, FVideoPanel.Width, FVideoPanel.Height,
+       ClientWidth, ClientHeight, Width, Height]));
   end;
 end;
-
 procedure TVlcPlayer.SetVideoMargins(TopMargin, BottomMargin: Integer);
 begin
   if (FVideoTopMargin <> TopMargin) or (FVideoBottomMargin <> BottomMargin) then
@@ -763,9 +1083,22 @@ begin
   FTopImage := TPicture.Create;
   FShowTopImage := True;
 
+  // Инициализация перехвата мыши
+  FOriginalWndProc := nil;
+  FMouseCapture := False;
+  FLastMousePos := Point(0, 0);
+
+  // ПЕРЕХВАТЫВАЕМ СООБЩЕНИЯ НА УРОВНЕ ОСНОВНОГО КОМПОНЕНТА
+  FOriginalWndProc := WindowProc;
+  WindowProc := MainWndProc;
+
   // Устанавливаем базовые заголовки по умолчанию
   SetBasicHeaders;
+
+  Log('VLC Player создан. Перехват событий мыши активирован.');
 end;
+
+
 
 destructor TVlcPlayer.Destroy;
 begin
@@ -774,6 +1107,18 @@ begin
   FOnLoadingProgress := nil;
   FOnBuffering := nil;
   FOnQualityChanged := nil;
+
+  // ОБНУЛЯЕМ СОБЫТИЯ МЫШИ
+  FOnVideoMouseDown := nil;
+  FOnVideoMouseUp := nil;
+  FOnVideoMouseMove := nil;
+  FOnVideoClick := nil;
+  FOnVideoDblClick := nil;
+  FOnVideoMouseWheel := nil;
+
+  // Восстанавливаем оригинальный WndProc
+  if Assigned(FOriginalWndProc) then
+    WindowProc := FOriginalWndProc;
 
   // Останавливаем таймер
   FProgressTimer.Enabled := False;
@@ -794,6 +1139,8 @@ begin
 
   inherited Destroy;
 end;
+
+
 
 procedure TVlcPlayer.TextItemChanged(Sender: TObject);
 begin
@@ -857,21 +1204,23 @@ procedure TVlcPlayer.Resize;
 begin
   inherited Resize;
 
+  Log(Format('RESIZE: Client=%dx%d, Bounds=%dx%d',
+    [ClientWidth, ClientHeight, Width, Height]));
+
   // Обновляем размер видео панели с учетом отступов
   UpdateVideoPanelMargins;
 
   // Обновляем позицию текста
-  FInfoText.Y := Height - 20;
+  FInfoText.Y := ClientHeight - 20;
+
+  ForceRehookMouseEvents;
 
   // Принудительно переустанавливаем видео вывод при изменении размера
   if (FPlayer <> nil) and (FVideoHandle <> 0) and IsPlaying then
   begin
-    // Небольшая задержка для стабильности
     Sleep(50);
     T_libvlc_media_player_set_hwnd(FPlayer, Pointer(FVideoHandle));
   end;
-
-  Log('Размер компонента изменен: ' + IntToStr(Width) + 'x' + IntToStr(Height));
 end;
 
 procedure TVlcPlayer.WndProc(var Message: TMessage);
